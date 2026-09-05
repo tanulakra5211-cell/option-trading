@@ -32,12 +32,36 @@ MEETINGS = ROOT / "board_meetings.csv"
 LOTS = ROOT / "lot_sizes.csv"
 
 BASE = "https://www.nseindia.com"
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+
+# Headers for loading a PAGE. The previous version asked for
+# "Accept: application/json" here, which no browser does when fetching a
+# homepage — that mismatch alone is enough to be fingerprinted and refused.
+BROWSER_HEADERS = {
+    "User-Agent": UA,
+    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+               "image/avif,image/webp,*/*;q=0.8"),
+    "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "Connection": "keep-alive",
+}
+
+# Headers for the /api/ endpoints, which genuinely do return JSON.
 HEADERS = {
-    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                   "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"),
+    "User-Agent": UA,
     "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8",
     "Referer": f"{BASE}/",
+    "Connection": "keep-alive",
 }
 ARCHIVE_HEADERS = {"Referer": f"{BASE}/all-reports",
                    "Accept": "text/csv,application/zip,*/*"}
@@ -51,47 +75,65 @@ HIST_COLS = ["DATE", "SYMBOL", "OPEN", "HIGH", "LOW", "CLOSE", "PREV_CLOSE",
              "VOLUME", "DELIV_PER"]
 
 
-def client(attempts: int = 3):
+def client(attempts: int = 4):
     """
-    Cookie-primed client. NSE rejects requests without a prior page visit.
+    Cookie-primed client, or None if NSE will not let us in.
 
-    Every call is guarded. The previous version let a connection error during
-    priming escape, which killed the whole script with a raw traceback before
-    a single line of useful output. Network calls to NSE fail often enough
-    that this has to be handled rather than assumed.
-
-    HTTP/2 is tried first because NSE fingerprints plain HTTP/1.1 clients, but
-    HTTP/2 itself sometimes breaks from CI runners — so both are attempted.
+    Two things matter here and both were wrong before. The homepage is
+    requested with browser page headers rather than JSON ones — asking for
+    JSON when loading a homepage is not something a browser does, and NSE
+    blocks on it. And HTTP/2 is tried first (plain HTTP/1.1 gets
+    fingerprinted) with HTTP/1.1 as a fallback, because HTTP/2 itself
+    sometimes fails from CI runners.
     """
     last = ""
     for attempt in range(attempts):
         for use_h2 in (True, False):
+            c = None
             try:
-                c = httpx.Client(http2=use_h2, headers=HEADERS, timeout=30.0,
-                                 follow_redirects=True)
+                c = httpx.Client(http2=use_h2, headers=BROWSER_HEADERS,
+                                 timeout=30.0, follow_redirects=True)
                 r = c.get(BASE)
                 if r.status_code >= 400:
-                    last = f"homepage returned HTTP {r.status_code}"
+                    last = f"homepage HTTP {r.status_code}"
                     c.close()
                     continue
-                time.sleep(0.6)
+                time.sleep(1.0)
                 c.get(f"{BASE}/market-data/live-equity-market")
-                time.sleep(0.6)
-                print(f"  session established (HTTP/{'2' if use_h2 else '1.1'})")
+                time.sleep(1.0)
+                # Swap to API headers now that cookies are held.
+                c.headers.update(HEADERS)
+                print(f"  connected (HTTP/{'2' if use_h2 else '1.1'})")
                 return c
             except Exception as exc:  # noqa: BLE001
-                last = f"{type(exc).__name__}: {str(exc)[:70]}"
-                try:
-                    c.close()
-                except Exception:
-                    pass
+                last = f"{type(exc).__name__}: {str(exc)[:60]}"
+                if c is not None:
+                    try:
+                        c.close()
+                    except Exception:
+                        pass
         if attempt < attempts - 1:
-            wait = 3 * (attempt + 1)
+            wait = 5 * (attempt + 1)
             print(f"  handshake failed ({last}) — retrying in {wait}s")
             time.sleep(wait)
 
     print(f"  could not reach NSE after {attempts} attempts: {last}")
     return None
+
+
+def bare_client():
+    """
+    A client with no cookie priming, for archive files only.
+
+    Some of NSE's static archive downloads serve without a session. When the
+    homepage refuses us, this is worth trying before giving up entirely —
+    it is how the collector can still get the F&O and price files on a day
+    when the site front end is blocking.
+    """
+    return httpx.Client(http2=True, timeout=30.0, follow_redirects=True,
+                        headers={**HEADERS,
+                                 "Referer": f"{BASE}/all-reports",
+                                 "Accept": "text/csv,application/zip,*/*"})
 
 
 def clean(df: pd.DataFrame) -> pd.DataFrame:
@@ -244,12 +286,11 @@ def main() -> int:
 
     print("Connecting to NSE…")
     cl = client()
-    if cl is None:
-        print("\nNothing collected — NSE could not be reached at all. This is "
-              "usually temporary; try again in a few minutes. If it persists, "
-              "NSE is refusing this runner and the collector needs to run "
-              "somewhere else.")
-        return 1
+    primed = cl is not None
+    if not primed:
+        print("  falling back to unprimed archive access — the static files "
+              "sometimes serve without a session even when the site does not")
+        cl = bare_client()
 
     done = {"fno": False, "history": 0, "meetings": 0}
 
@@ -332,8 +373,17 @@ def main() -> int:
 
     # The app is usable with F&O alone, so only a total failure is an error.
     if not done["fno"] and done["history"] == 0:
-        print("Nothing was collected. Re-run — NSE refuses requests "
-              "intermittently and a retry often succeeds.")
+        print("\nNothing was collected.")
+        if not primed:
+            print("NSE refused the session handshake and the archive files did "
+                  "not serve either — this runner's IP range is being blocked "
+                  "today. It is usually temporary: re-run in an hour. If it "
+                  "keeps happening, copy data/ across from another repo that "
+                  "collected successfully, or run collect.py on your own "
+                  "machine, where a home connection is not blocked.")
+        else:
+            print("The session worked but no files came back. Likely a holiday, "
+                  "or NSE has not published yet — it does so after 19:00 IST.")
         return 1
     return 0
 

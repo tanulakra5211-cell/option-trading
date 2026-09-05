@@ -24,7 +24,7 @@ import streamlit as st
 st.set_page_config(page_title="Options Desk", page_icon="◆", layout="wide",
                    initial_sidebar_state="collapsed")
 
-VERSION = "v2"
+VERSION = "v3"
 DATA = Path(__file__).parent / "data"
 FNO_DIR = DATA / "fno"
 HIST_DIR = DATA / "history"
@@ -220,19 +220,36 @@ def load_lots() -> dict:
         return {}
 
 
+JOURNAL_TEXT = ["date", "symbol", "type", "expiry", "why", "status", "notes"]
+JOURNAL_NUM = ["strike", "lots", "entry", "target", "stop", "exit"]
+JOURNAL_COLS = ["date", "symbol", "strike", "type", "expiry", "lots", "entry",
+                "target", "stop", "why", "status", "exit", "notes"]
+
+
 def load_journal() -> pd.DataFrame:
-    cols = ["date", "symbol", "strike", "type", "expiry", "lots", "entry",
-            "target", "stop", "why", "status", "exit", "notes"]
+    """
+    The journal with column types pinned.
+
+    An empty text column round-trips through CSV as float NaN, which then
+    clashes with a text column config in the editor and raises. Types are set
+    explicitly here rather than inferred.
+    """
     if JOURNAL.exists():
         try:
             df = pd.read_csv(JOURNAL, skipinitialspace=True)
-            for c in cols:
-                if c not in df.columns:
-                    df[c] = ""
-            return df[cols]
         except Exception:
-            pass
-    return pd.DataFrame(columns=cols)
+            df = pd.DataFrame(columns=JOURNAL_COLS)
+    else:
+        df = pd.DataFrame(columns=JOURNAL_COLS)
+
+    for c in JOURNAL_COLS:
+        if c not in df.columns:
+            df[c] = None
+    for c in JOURNAL_TEXT:
+        df[c] = df[c].fillna("").astype(str).replace("nan", "")
+    for c in JOURNAL_NUM:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df[JOURNAL_COLS]
 
 
 # ============================================================ ANALYSIS =======
@@ -1035,10 +1052,19 @@ with tab_journal, safe("Journal"):
         edited = st.data_editor(
             j, num_rows="dynamic", use_container_width=True, key="j_edit",
             column_config={
-                "status": st.column_config.SelectboxColumn(
-                    options=["open", "closed"]),
-                "type": st.column_config.SelectboxColumn(options=["CE", "PE"]),
+                "date": st.column_config.TextColumn("Date", width="small"),
+                "symbol": st.column_config.TextColumn("Stock", width="small"),
+                "strike": st.column_config.NumberColumn("Strike", format="%.0f"),
+                "type": st.column_config.SelectboxColumn("Type", options=["CE", "PE"]),
+                "expiry": st.column_config.TextColumn("Expiry", width="small"),
+                "lots": st.column_config.NumberColumn("Lots", format="%d"),
+                "entry": st.column_config.NumberColumn("Entry", format="%.2f"),
+                "target": st.column_config.NumberColumn("Target", format="%.2f"),
+                "stop": st.column_config.NumberColumn("Stop", format="%.2f"),
                 "why": st.column_config.TextColumn("Why I took it", width="large"),
+                "status": st.column_config.SelectboxColumn(
+                    "Status", options=["open", "closed"]),
+                "exit": st.column_config.NumberColumn("Exit", format="%.2f"),
                 "notes": st.column_config.TextColumn("Afterwards", width="large"),
             })
         c1, c2 = st.columns(2)

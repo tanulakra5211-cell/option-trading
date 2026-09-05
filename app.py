@@ -24,7 +24,7 @@ import streamlit as st
 st.set_page_config(page_title="Options Desk", page_icon="◆", layout="wide",
                    initial_sidebar_state="collapsed")
 
-VERSION = "v3"
+VERSION = "v4"
 DATA = Path(__file__).parent / "data"
 FNO_DIR = DATA / "fno"
 HIST_DIR = DATA / "history"
@@ -588,6 +588,183 @@ def pre_trade_checks(entry, qty, capital, stop_move_pct, daily_range_pct,
     return out
 
 
+# ======================================================= UNEXPLAINED FALLS ===
+# The idea: a stock dragged down by the market, with nothing wrong at the
+# company, tends to come back — while one that fell on its own news may not.
+#
+# Making that precise needs two things. First a market return, taken as the
+# median move across every stock that traded, which needs no index feed and is
+# harder to distort than a cap-weighted index. Second a beta, because a stock
+# that habitually moves 1.5x the market falling 1.5x is not unusual at all —
+# it is behaving normally. What is left after removing beta times the market
+# is the part the market does NOT explain, and that is what this looks for.
+
+def market_returns(hist: pd.DataFrame) -> pd.Series:
+    """Daily median return across all stocks — a robust market proxy."""
+    if hist.empty:
+        return pd.Series(dtype=float)
+    wide = hist.pivot_table(index="DATE", columns="SYMBOL", values="CLOSE",
+                            aggfunc="last").sort_index()
+    return wide.pct_change().median(axis=1).dropna()
+
+
+def compute_betas(hist: pd.DataFrame, window: int = 120) -> pd.DataFrame:
+    """
+    Beta and residual volatility per stock, against the market proxy.
+
+    Residual volatility matters as much as beta: a 6% unexplained fall is
+    remarkable in a placid stock and unremarkable in a jumpy one, so the
+    ranking below uses how many of its OWN residual standard deviations the
+    move represents rather than the raw percentage.
+    """
+    if hist.empty:
+        return pd.DataFrame()
+
+    wide = hist.pivot_table(index="DATE", columns="SYMBOL", values="CLOSE",
+                            aggfunc="last").sort_index().tail(window + 1)
+    rets = wide.pct_change().dropna(how="all")
+    mkt = rets.median(axis=1)
+    if len(rets) < 40:
+        return pd.DataFrame()
+
+    rows = []
+    mkt_var = mkt.var()
+    for sym in rets.columns:
+        r = rets[sym].dropna()
+        if len(r) < 40 or mkt_var == 0:
+            continue
+        aligned = mkt.reindex(r.index)
+        beta = float(r.cov(aligned) / mkt_var)
+        resid = r - beta * aligned
+        rows.append({"Symbol": sym, "Beta": beta,
+                     "Residual vol %": float(resid.std() * 100),
+                     "Days": len(r)})
+    return pd.DataFrame(rows)
+
+
+def unexplained_falls(hist: pd.DataFrame, lookback: int = 5,
+                      min_sigma: float = 1.5, window: int = 120) -> pd.DataFrame:
+    """
+    Stocks that fell further than the market and their own beta explain.
+
+    Ranked by standard deviations of their own residual, not by raw percentage
+    — otherwise the list is simply the most volatile stocks every time.
+    """
+    betas = compute_betas(hist, window)
+    if betas.empty:
+        return pd.DataFrame()
+
+    wide = hist.pivot_table(index="DATE", columns="SYMBOL", values="CLOSE",
+                            aggfunc="last").sort_index()
+    if len(wide) <= lookback:
+        return pd.DataFrame()
+
+    period = (wide.iloc[-1] / wide.iloc[-lookback - 1] - 1) * 100
+    mkt_period = float(period.median())
+
+    rows = []
+    for _, b in betas.iterrows():
+        sym = b["Symbol"]
+        if sym not in period.index or period[sym] != period[sym]:
+            continue
+        actual = float(period[sym])
+        expected = b["Beta"] * mkt_period
+        resid = actual - expected
+        # Scale the residual to the holding period, then express in sigmas.
+        sigma = b["Residual vol %"] * (lookback ** 0.5)
+        if sigma <= 0:
+            continue
+        rows.append({
+            "Symbol": sym,
+            "Now": float(wide[sym].iloc[-1]),
+            f"{lookback}d move %": actual,
+            "Market did %": mkt_period,
+            "Beta": b["Beta"],
+            "Expected %": expected,
+            "Unexplained %": resid,
+            "Sigmas": resid / sigma,
+        })
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    out = out[out["Sigmas"] <= -abs(min_sigma)]
+    return out.sort_values("Sigmas")
+
+
+def test_reversion(hist: pd.DataFrame, lookback: int = 5, horizon: int = 5,
+                   min_sigma: float = 1.5, window: int = 120) -> dict:
+    """
+    Does the idea actually work on your own stored history?
+
+    Finds every past instance of an unexplained fall and measures what the
+    next `horizon` days did, against the base rate for the same stocks over
+    the same windows. Overlapping windows are accounted for — otherwise a
+    hundred observations look like a hundred independent ones when they are
+    closer to twenty.
+    """
+    if hist.empty:
+        return {}
+
+    wide = hist.pivot_table(index="DATE", columns="SYMBOL", values="CLOSE",
+                            aggfunc="last").sort_index()
+    if len(wide) < window + lookback + horizon + 10:
+        return {"error": f"needs about {window + lookback + horizon + 10} "
+                         f"trading days of history, has {len(wide)}"}
+
+    rets = wide.pct_change()
+    mkt = rets.median(axis=1)
+
+    hits, base = [], []
+    step = max(horizon // 2, 1)
+    for i in range(window, len(wide) - horizon, step):
+        hist_slice = rets.iloc[i - window:i]
+        mkt_slice = mkt.iloc[i - window:i]
+        mvar = mkt_slice.var()
+        if mvar == 0 or hist_slice.empty:
+            continue
+
+        period = (wide.iloc[i] / wide.iloc[i - lookback] - 1) * 100
+        mkt_period = float(period.median())
+        fwd = (wide.iloc[i + horizon] / wide.iloc[i] - 1) * 100
+        base.extend(fwd.dropna().tolist())
+
+        for sym in wide.columns:
+            r = hist_slice[sym].dropna()
+            if len(r) < 40:
+                continue
+            beta = float(r.cov(mkt_slice.reindex(r.index)) / mvar)
+            resid_vol = float((r - beta * mkt_slice.reindex(r.index)).std() * 100)
+            if resid_vol <= 0:
+                continue
+            if period.get(sym) != period.get(sym):
+                continue
+            resid = float(period[sym]) - beta * mkt_period
+            if resid / (resid_vol * (lookback ** 0.5)) <= -abs(min_sigma):
+                f = fwd.get(sym)
+                if f == f:
+                    hits.append(float(f))
+
+    if not hits:
+        return {"error": "no historical instances found at that threshold"}
+
+    h = pd.Series(hits)
+    b = pd.Series(base)
+    eff_n = max(len(h) / max(horizon, 1), 1)
+    se = h.std() / (eff_n ** 0.5) if len(h) > 1 else float("inf")
+    edge = float(h.median() - b.median())
+
+    return {
+        "n": len(h), "effective_n": eff_n,
+        "median": float(h.median()), "base_median": float(b.median()),
+        "edge": edge,
+        "hit_rate": float((h > 0).mean() * 100),
+        "base_hit": float((b > 0).mean() * 100),
+        "significant": bool(se != float("inf") and abs(edge) > 2 * se and eff_n >= 5),
+        "threshold": 2 * se if se != float("inf") else float("nan"),
+    }
+
+
 # ============================================================== STYLING ======
 
 st.markdown("""
@@ -629,8 +806,9 @@ def tint(df, cols):
 fno = load_fno()
 hist = load_history()
 
-tab_today, tab_trade, tab_open, tab_journal, tab_data = st.tabs(
-    ["Today", "Trade", "Open positions", "Journal", "Data"])
+(tab_today, tab_falls, tab_trade, tab_open, tab_journal,
+ tab_data) = st.tabs(["Today", "Unfair falls", "Trade", "Open positions",
+                      "Journal", "Data"])
 
 
 with tab_today, safe("Today"):
@@ -689,6 +867,131 @@ with tab_today, safe("Today"):
                 'periods, and stocks genuinely move more around results, so '
                 'options that look expensive before earnings may simply be priced '
                 'correctly.</div>', unsafe_allow_html=True)
+
+
+with tab_falls, safe("Unfair falls"):
+    st.markdown("### Which stocks fell more than the market explains?")
+    st.markdown(
+        "Your idea, made precise. A stock that falls because the whole market "
+        "fell is a different thing from one that falls on its own news — the "
+        "first has nothing wrong with it. Separating them needs **beta**: a "
+        "stock that habitually moves 1.5x the market dropping 1.5x is behaving "
+        "normally, not being punished."
+    )
+
+    if hist.empty:
+        st.info("Needs price history. Open the Data tab.")
+    else:
+        f1, f2, f3 = st.columns(3)
+        look = f1.select_slider("Fall measured over (days)", options=[3, 5, 10, 20],
+                                value=5, key="uf_look")
+        sig = f2.slider("How unusual (sigmas)", 1.0, 3.0, 1.5, 0.25, key="uf_sig",
+                        help="How many of the stock's own residual standard "
+                             "deviations the unexplained part represents. Higher "
+                             "means rarer.")
+        fno_only = f3.checkbox("Only stocks with options", value=True, key="uf_fno")
+
+        with st.spinner("Estimating betas and residuals…"):
+            falls = unexplained_falls(hist, look, sig)
+
+        if fno_only and not falls.empty and not fno.empty:
+            tradable = set(fno["SYMBOL"].dropna().unique())
+            falls = falls[falls["Symbol"].isin(tradable)]
+
+        if falls.empty:
+            st.info("Nothing fell unusually today at that threshold. Lower the "
+                    "sigma slider, or check back after a down day.")
+        else:
+            st.caption(f"{len(falls)} stocks. The market moved "
+                       f"{falls['Market did %'].iloc[0]:+.2f}% over {look} days.")
+
+            for _, r in falls.head(6).iterrows():
+                st.markdown(
+                    f'<div class="card"><b style="font-size:1.05rem;">{r["Symbol"]}</b>'
+                    f'<span style="color:#8b95a1;"> · Rs {r["Now"]:,.2f}</span><br>'
+                    f'<span style="color:#8b95a1;font-size:0.87rem;">'
+                    f'Fell <b>{r[f"{look}d move %"]:.1f}%</b> while the market did '
+                    f'{r["Market did %"]:+.1f}%. With a beta of {r["Beta"]:.2f} it '
+                    f'"should" have fallen {r["Expected %"]:.1f}%, so '
+                    f'<b>{abs(r["Unexplained %"]):.1f}%</b> of the drop is '
+                    f'unexplained — {abs(r["Sigmas"]):.1f} standard deviations of '
+                    f'its own normal wobble.</span></div>',
+                    unsafe_allow_html=True)
+
+            with st.expander("Full list"):
+                st.dataframe(tint(falls, [f"{look}d move %", "Market did %",
+                                          "Unexplained %", "Sigmas"]),
+                             use_container_width=True, hide_index=True)
+
+            st.markdown(
+                '<div class="note"><b>This finds the fall, not the reason.</b> '
+                'An unexplained drop means the market did not cause it — it does '
+                'not mean nothing caused it. Company news often moves the price '
+                'before it reaches a headline, and this app has no news feed, so '
+                'check the stock on your broker or the exchange filings page '
+                'before assuming the fall was unfair. The ones worth trading are '
+                'those where you look and genuinely find nothing.</div>',
+                unsafe_allow_html=True)
+
+        st.divider()
+        st.markdown("#### Does this actually work?")
+        st.caption(
+            "The strategy tested against your own stored history: every past "
+            "instance of an unexplained fall, and what the following days did — "
+            "measured against the base rate for the same stocks over the same "
+            "windows."
+        )
+
+        if st.button("Test it", key="uf_test"):
+            st.session_state["uf_ran"] = True
+
+        if st.session_state.get("uf_ran"):
+            h1, h2 = st.columns(2)
+            horizon = h1.select_slider("Hold for (days)", options=[3, 5, 10, 20],
+                                       value=5, key="uf_hor")
+            test_sig = h2.slider("At what sigma", 1.0, 3.0, float(sig), 0.25,
+                                 key="uf_tsig")
+
+            with st.spinner("Walking through the history…"):
+                res = test_reversion(hist, look, horizon, test_sig)
+
+            if "error" in res:
+                st.warning(res["error"])
+            else:
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Instances found", res["n"])
+                m2.metric(f"Median {horizon}d after", f"{res['median']:+.2f}%",
+                          delta=f"{res['edge']:+.2f}% vs base")
+                m3.metric("Went up", f"{res['hit_rate']:.0f}%",
+                          delta=f"{res['hit_rate'] - res['base_hit']:+.0f}pp")
+                m4.metric("Independent windows", f"{res['effective_n']:.0f}",
+                          help="Overlapping windows share most of their days, so "
+                               "this governs reliability rather than the raw count.")
+
+                colour = "#2fbf71" if res["significant"] else "#c9a227"
+                verdict = ("This beats the base rate by more than noise explains"
+                           if res["significant"] else
+                           "Not distinguishable from the base rate")
+                st.markdown(
+                    f'<div style="border-left:3px solid {colour};padding:0.7rem 1rem;'
+                    f'background:#151a21;margin:0.5rem 0;color:#e6eaef;">'
+                    f'<b>{verdict}.</b><br>'
+                    f'<span style="color:#8b95a1;font-size:0.86rem;">'
+                    f'After an unexplained fall these stocks did '
+                    f'{res["median"]:+.2f}% over the next {horizon} days, against '
+                    f'{res["base_median"]:+.2f}% for the same stocks generally — '
+                    f'an edge of {res["edge"]:+.2f}% against a noise threshold of '
+                    f'±{res["threshold"]:.2f}%.</span></div>',
+                    unsafe_allow_html=True)
+
+                st.markdown(
+                    '<div class="note">Two things to hold onto whatever this '
+                    'says. It is one market regime — the period you happen to '
+                    'have collected — and mean reversion works until it does '
+                    'not, which is usually when something genuinely was wrong. '
+                    'And it takes no account of costs; at 3% round trip on '
+                    'options, an edge under about 3% is not an edge you can '
+                    'trade.</div>', unsafe_allow_html=True)
 
 
 with tab_trade, safe("Trade"):

@@ -24,7 +24,7 @@ import streamlit as st
 st.set_page_config(page_title="Options Desk", page_icon="◆", layout="wide",
                    initial_sidebar_state="collapsed")
 
-VERSION = "v4"
+VERSION = "v5"
 DATA = Path(__file__).parent / "data"
 FNO_DIR = DATA / "fno"
 HIST_DIR = DATA / "history"
@@ -765,6 +765,186 @@ def test_reversion(hist: pd.DataFrame, lookback: int = 5, horizon: int = 5,
     }
 
 
+# ============================================================= PATTERNS ======
+# A reference built from YOUR stored data rather than textbook drawings.
+#
+# Every pattern guide shows the examples that worked. This shows real recent
+# instances from the market you trade, and — more usefully — what happened
+# afterwards across every instance in the history, including the failures.
+# A pattern with a 52% hit rate looks very different once you can see that.
+
+PATTERNS = {
+    "Breakout above 20-day high": {
+        "what": "Price closes above the highest point of the previous 20 days.",
+        "why": "The idea is that everyone who bought in that range is now in "
+               "profit, so there is no trapped supply overhead.",
+        "catch": "Breakouts fail often, and a breakout without a volume "
+                 "increase fails more. It also fires after the move has begun.",
+    },
+    "Breakdown below 20-day low": {
+        "what": "Price closes below the lowest point of the previous 20 days.",
+        "why": "The mirror image — everyone who bought recently is now losing.",
+        "catch": "In a range-bound market this is simply the bottom of the "
+                 "range, which is where it stops falling.",
+    },
+    "Higher highs and higher lows": {
+        "what": "Both recent peaks and recent troughs are above the previous "
+                "ones.",
+        "why": "The textbook definition of an uptrend, and the most durable of "
+               "these patterns because it describes structure rather than a "
+               "single bar.",
+        "catch": "It describes what has already happened. Trends end without "
+                 "warning, and the structure only breaks after the fact.",
+    },
+    "Consolidation": {
+        "what": "The last 20 days span less than half the range of the last 60.",
+        "why": "Volatility contracts before it expands, so a tight range often "
+               "precedes a larger move.",
+        "catch": "It says nothing about direction. A tight range breaks both "
+                 "ways, and traders routinely assume it will break the way they "
+                 "are positioned.",
+    },
+    "Above 200-day average": {
+        "what": "Price is above its 200-day moving average.",
+        "why": "The line most institutional mandates watch. Roughly separates "
+               "stocks in long uptrends from the rest.",
+        "catch": "Slow. A stock can lose a third of its value while still "
+                 "above the line.",
+    },
+    "Oversold (RSI below 30)": {
+        "what": "Relative Strength Index under 30 — recent losses heavily "
+                "outweigh recent gains.",
+        "why": "Conventionally read as a bounce candidate.",
+        "catch": "RSI stays below 30 for months in a falling stock. Oversold "
+                 "means fast, not finished.",
+    },
+    "Near 52-week high": {
+        "what": "Within 2% of the highest close in the past year.",
+        "why": "Momentum research repeatedly finds recent winners continue "
+               "over medium horizons.",
+        "catch": "Also where a stock tops out. The pattern cannot tell you "
+                 "which of the two you are looking at.",
+    },
+    "Fell more than the market explains": {
+        "what": "A drop well beyond what this stock's beta and the market "
+                "move account for.",
+        "why": "If the market did not cause it and no news did either, there "
+               "may be nothing wrong.",
+        "catch": "Company news moves price before it reaches a headline. "
+                 "Unexplained is not the same as unfair.",
+    },
+}
+
+
+def detect_pattern_series(closes: pd.Series, highs=None, lows=None) -> dict:
+    """
+    Boolean series for each pattern across a stock's whole history.
+
+    Computed for every day, not just today, so instances can be found in the
+    past and their outcomes measured.
+    """
+    c = closes.dropna()
+    if len(c) < 210:
+        return {}
+    h = highs.reindex(c.index).fillna(c) if highs is not None else c
+    lo = lows.reindex(c.index).fillna(c) if lows is not None else c
+
+    delta = c.diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    rsi = 100 - (100 / (1 + gain / loss.replace(0, float("nan"))))
+
+    hi20 = h.rolling(20).max().shift(1)
+    lo20 = lo.rolling(20).min().shift(1)
+    sma200 = c.rolling(200).mean()
+    hi52 = c.rolling(250).max()
+
+    r20 = h.rolling(20).max() - lo.rolling(20).min()
+    r60 = h.rolling(60).max() - lo.rolling(60).min()
+
+    sh = h.rolling(11, center=True).max()
+    sl = lo.rolling(11, center=True).min()
+    swing_hi = (h == sh)
+    swing_lo = (lo == sl)
+
+    return {
+        "Breakout above 20-day high": c > hi20,
+        "Breakdown below 20-day low": c < lo20,
+        "Higher highs and higher lows": (
+            (h.rolling(20).max() > h.rolling(20).max().shift(20))
+            & (lo.rolling(20).min() > lo.rolling(20).min().shift(20))),
+        "Consolidation": r20 < r60 * 0.45,
+        "Above 200-day average": c > sma200,
+        "Oversold (RSI below 30)": rsi < 30,
+        "Near 52-week high": c >= hi52 * 0.98,
+        "_swing_hi": swing_hi, "_swing_lo": swing_lo,
+    }
+
+
+def pattern_outcomes(hist: pd.DataFrame, pattern: str, horizon: int = 10,
+                     max_symbols: int = 120) -> dict:
+    """
+    Every historical instance of a pattern, and what followed.
+
+    The base rate — what the same stocks did over the same windows regardless
+    of the pattern — is reported alongside. Without it a 55% hit rate sounds
+    impressive when the stock rose 55% of the time anyway.
+    """
+    if hist.empty:
+        return {}
+    wide = hist.pivot_table(index="DATE", columns="SYMBOL", values="CLOSE",
+                            aggfunc="last").sort_index()
+    highs = hist.pivot_table(index="DATE", columns="SYMBOL", values="HIGH",
+                             aggfunc="last").sort_index() \
+        if "HIGH" in hist.columns else None
+    lows = hist.pivot_table(index="DATE", columns="SYMBOL", values="LOW",
+                            aggfunc="last").sort_index() \
+        if "LOW" in hist.columns else None
+
+    symbols = list(wide.columns)[:max_symbols]
+    after, base, examples = [], [], []
+
+    for sym in symbols:
+        c = wide[sym].dropna()
+        if len(c) < 210 + horizon:
+            continue
+        flags = detect_pattern_series(
+            c,
+            highs[sym] if highs is not None and sym in highs else None,
+            lows[sym] if lows is not None and sym in lows else None)
+        if pattern not in flags:
+            continue
+
+        fwd = (c.shift(-horizon) / c - 1) * 100
+        base.extend(fwd.dropna().tolist())
+
+        sig = flags[pattern].fillna(False)
+        # Only the day a pattern first appears, so a condition that persists
+        # for weeks is not counted as dozens of separate signals.
+        onset = sig & ~sig.shift(1).fillna(False)
+        hit_dates = c.index[onset.reindex(c.index).fillna(False)]
+        for d in hit_dates:
+            v = fwd.get(d)
+            if v == v:
+                after.append(float(v))
+                examples.append((sym, d, float(v)))
+
+    if not after:
+        return {}
+    a, b = pd.Series(after), pd.Series(base)
+    eff_n = max(len(a) / max(horizon, 1), 1)
+    se = a.std() / (eff_n ** 0.5) if len(a) > 1 else float("inf")
+    edge = float(a.median() - b.median())
+    return {
+        "n": len(a), "effective_n": eff_n,
+        "median": float(a.median()), "base_median": float(b.median()),
+        "edge": edge, "hit": float((a > 0).mean() * 100),
+        "base_hit": float((b > 0).mean() * 100),
+        "significant": bool(se != float("inf") and abs(edge) > 2 * se and eff_n >= 5),
+        "examples": sorted(examples, key=lambda x: x[1], reverse=True)[:8],
+    }
+
+
 # ============================================================== STYLING ======
 
 st.markdown("""
@@ -806,9 +986,9 @@ def tint(df, cols):
 fno = load_fno()
 hist = load_history()
 
-(tab_today, tab_falls, tab_trade, tab_open, tab_journal,
+(tab_today, tab_falls, tab_trade, tab_open, tab_journal, tab_patterns,
  tab_data) = st.tabs(["Today", "Unfair falls", "Trade", "Open positions",
-                      "Journal", "Data"])
+                      "Journal", "Patterns", "Data"])
 
 
 with tab_today, safe("Today"):
@@ -1380,6 +1560,113 @@ with tab_journal, safe("Journal"):
                            file_name="journal.csv", mime="text/csv",
                            help="Commit this to data/ in your repo to keep it — "
                                 "hosted apps reset their disk on rebuild.")
+
+
+with tab_patterns, safe("Patterns"):
+    st.markdown("### Chart patterns, and whether they work")
+    st.markdown(
+        "Every pattern guide shows the examples that worked. This finds real "
+        "instances in **your own stored data** and reports what happened after "
+        "all of them — including the failures — against the base rate for the "
+        "same stocks over the same windows."
+    )
+
+    if hist.empty:
+        st.info("Needs price history. Open the Data tab.")
+    else:
+        days = hist["DATE"].nunique()
+        if days < 260:
+            st.markdown(
+                f'<div class="note">Only {days} trading days stored. These '
+                'patterns need 210 days per stock before they can be computed '
+                'at all, and a year or more before the outcomes mean much. '
+                'Run the collector with a larger backfill.</div>',
+                unsafe_allow_html=True)
+
+        pick = st.selectbox("Pattern", list(PATTERNS.keys()), key="pt_pick")
+        info = PATTERNS[pick]
+
+        st.markdown(
+            f'<div class="card"><b>{pick}</b><br>'
+            f'<span style="color:#8b95a1;font-size:0.9rem;">'
+            f'<b>What it is:</b> {info["what"]}<br>'
+            f'<b>Why people use it:</b> {info["why"]}<br>'
+            f'<b>The catch:</b> {info["catch"]}</span></div>',
+            unsafe_allow_html=True)
+
+        if pick == "Fell more than the market explains":
+            st.info("This one has its own tab — see **Unfair falls**, which "
+                    "includes a test of it against your history.")
+        else:
+            horizon = st.select_slider("Measure what happened over (days)",
+                                       options=[5, 10, 20], value=10, key="pt_hor")
+            if st.button("Find real instances and outcomes", key="pt_go"):
+                st.session_state["pt_ran"] = pick
+
+            if st.session_state.get("pt_ran") == pick:
+                with st.spinner("Scanning your history…"):
+                    res = pattern_outcomes(hist, pick, horizon)
+
+                if not res:
+                    st.warning("No instances found — usually not enough history "
+                               "per stock yet.")
+                else:
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Instances", res["n"])
+                    m2.metric(f"Median {horizon}d after", f"{res['median']:+.2f}%",
+                              delta=f"{res['edge']:+.2f}% vs base")
+                    m3.metric("Went up", f"{res['hit']:.0f}%",
+                              delta=f"{res['hit'] - res['base_hit']:+.0f}pp")
+                    m4.metric("Independent windows", f"{res['effective_n']:.0f}")
+
+                    colour = "#2fbf71" if res["significant"] else "#c9a227"
+                    verdict = ("Beats the base rate by more than noise explains"
+                               if res["significant"] else
+                               "Not distinguishable from the base rate")
+                    st.markdown(
+                        f'<div style="border-left:3px solid {colour};'
+                        f'padding:0.7rem 1rem;background:#151a21;margin:0.5rem 0;'
+                        f'color:#e6eaef;"><b>{verdict}.</b><br>'
+                        f'<span style="color:#8b95a1;font-size:0.86rem;">'
+                        f'After this pattern: {res["median"]:+.2f}% over '
+                        f'{horizon} days, up {res["hit"]:.0f}% of the time. '
+                        f'The same stocks generally: {res["base_median"]:+.2f}%, '
+                        f'up {res["base_hit"]:.0f}% of the time.</span></div>',
+                        unsafe_allow_html=True)
+
+                    st.markdown("**Real recent instances**")
+                    ex = pd.DataFrame(res["examples"],
+                                      columns=["Symbol", "Date", f"{horizon}d after %"])
+                    ex["Date"] = pd.to_datetime(ex["Date"]).dt.date
+                    st.dataframe(tint(ex, [f"{horizon}d after %"]),
+                                 use_container_width=True, hide_index=True)
+
+                    if len(ex):
+                        chart_sym = st.selectbox("Chart one of these",
+                                                 ex["Symbol"].unique(), key="pt_chart")
+                        row = ex[ex["Symbol"] == chart_sym].iloc[0]
+                        g = hist[hist["SYMBOL"] == chart_sym].set_index("DATE")["CLOSE"]
+                        when = pd.Timestamp(row["Date"])
+                        window = g[(g.index >= when - pd.Timedelta(days=90))
+                                   & (g.index <= when + pd.Timedelta(days=60))]
+                        if len(window) > 5:
+                            st.line_chart(window, height=280)
+                            st.caption(
+                                f"{chart_sym} around {row['Date']}, when the "
+                                f"pattern appeared. It went "
+                                f"{row[f'{horizon}d after %']:+.1f}% over the "
+                                f"following {horizon} days. One instance is an "
+                                f"anecdote — the numbers above are the evidence."
+                            )
+
+                    st.markdown(
+                        '<div class="note">Read the <b>vs base</b> figures rather '
+                        'than the headline ones. A pattern followed by +1.2% looks '
+                        'good until you see the same stocks averaged +1.1% anyway. '
+                        'And most of these will come back "not distinguishable" — '
+                        'that is the honest result, and it is why patterns are '
+                        'better used to organise what you are looking at than to '
+                        'decide what to buy.</div>', unsafe_allow_html=True)
 
 
 with tab_data, safe("Data"):

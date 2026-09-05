@@ -24,7 +24,7 @@ import streamlit as st
 st.set_page_config(page_title="Options Desk", page_icon="◆", layout="wide",
                    initial_sidebar_state="collapsed")
 
-VERSION = "v1"
+VERSION = "v2"
 DATA = Path(__file__).parent / "data"
 FNO_DIR = DATA / "fno"
 HIST_DIR = DATA / "history"
@@ -427,6 +427,150 @@ def build_plan(spot, strike, entry, dte, iv, is_call, qty, hold,
     return pd.DataFrame(rows)
 
 
+# ========================================================== OPEN POSITIONS ===
+# What you are holding right now, and what it is doing.
+#
+# One real limitation: the stored data is a previous close, so during market
+# hours every premium here is yesterday's. Rather than present stale numbers
+# as live, the current premium is something you type in from your broker. An
+# app that looked live and was not would be worse than one that asks.
+
+def position_status(row, current_premium, lots_map, today=None):
+    """
+    One open position, marked to a premium you supply.
+
+    Everything is computed from your own entry, target and stop rather than
+    re-derived, because those are what you actually committed to.
+    """
+    today = today or pd.Timestamp(datetime.now().date())
+    sym = str(row.get("symbol", ""))
+    qty = int(row.get("lots") or 0) * lots_map.get(sym, 1)
+
+    try:
+        entry = float(row.get("entry") or 0)
+        target = float(row.get("target") or 0)
+        stop = float(row.get("stop") or 0)
+    except (TypeError, ValueError):
+        return None
+    if entry <= 0 or qty <= 0:
+        return None
+
+    cost = entry * qty
+    value = current_premium * qty
+    gross = value - cost
+    net = gross - round_trip_cost(entry, current_premium, qty)
+
+    try:
+        expiry = pd.Timestamp(str(row.get("expiry")))
+        days_left = max((expiry - today).days, 0)
+    except Exception:
+        expiry, days_left = pd.NaT, None
+
+    to_target = ((target / current_premium) - 1) * 100 if current_premium else float("nan")
+    to_stop = ((stop / current_premium) - 1) * 100 if current_premium else float("nan")
+
+    # How much of the distance from entry to target or stop has been covered.
+    if current_premium >= entry and target > entry:
+        progress = min((current_premium - entry) / (target - entry), 1.0) * 100
+        toward = "target"
+    elif current_premium < entry and entry > stop:
+        progress = min((entry - current_premium) / (entry - stop), 1.0) * 100
+        toward = "stop"
+    else:
+        progress, toward = 0.0, "—"
+
+    flags = []
+    if current_premium <= stop:
+        flags.append("STOP HIT")
+    if current_premium >= target and target > 0:
+        flags.append("TARGET HIT")
+    if days_left is not None and days_left <= 5:
+        flags.append(f"{days_left}d to expiry")
+
+    return {
+        "Symbol": sym, "Contract": f"{row.get('strike','')} {row.get('type','')}",
+        "Expiry": expiry.date() if pd.notna(expiry) else "—",
+        "Days left": days_left, "Lots": row.get("lots"), "Qty": qty,
+        "Entry": entry, "Now": current_premium,
+        "Target": target, "Stop": stop,
+        "Cost": cost, "Value": value, "P&L net": net,
+        "Return %": (net / cost) * 100 if cost else float("nan"),
+        "To target %": to_target, "To stop %": to_stop,
+        "Progress %": progress, "Toward": toward,
+        "Flags": ", ".join(flags) if flags else "",
+        "Why": str(row.get("why", ""))[:90],
+    }
+
+
+# ======================================================= PRE-TRADE CHECKS ====
+# Five questions before placing. None of them predicts anything; each one
+# catches a specific way trades go wrong that is obvious afterwards and
+# invisible beforehand.
+
+def pre_trade_checks(entry, qty, capital, stop_move_pct, daily_range_pct,
+                     breakeven_move_pct, typical_move_pct, days_to_expiry,
+                     event_days, why_written, lots=1) -> list:
+    """Returns (passed, title, detail) for each check."""
+    out = []
+    cost = entry * qty
+    risk_pct = (cost / capital * 100) if capital else float("nan")
+
+    # Indian lot sizes are large enough that one lot of a cheap option can
+    # exceed a sensible position limit on a small account. That is worth
+    # saying outright rather than reporting as a generic failure — the answer
+    # is a different contract or more capital, not a smaller size.
+    one_lot_cost = cost / max(lots, 1) if lots else cost
+    one_lot_pct = (one_lot_cost / capital * 100) if capital else float("nan")
+    detail = (f"This costs Rs {cost:,.0f}, which is {risk_pct:.1f}% of your "
+              f"capital. A bought option can go to zero, so the whole premium "
+              f"is the risk — not the notional.")
+    if one_lot_pct == one_lot_pct and one_lot_pct > 2.0:
+        detail += (f" Note that a single lot already costs Rs {one_lot_cost:,.0f} "
+                   f"({one_lot_pct:.1f}%), so no size fixes this — you need a "
+                   f"cheaper contract, a further strike, or more capital before "
+                   f"this instrument fits the account.")
+    out.append((risk_pct <= 2.0 if risk_pct == risk_pct else False,
+                "Position is 2% of capital or less", detail))
+
+    ok_stop = (stop_move_pct == stop_move_pct and daily_range_pct == daily_range_pct
+               and abs(stop_move_pct) > daily_range_pct)
+    out.append((
+        ok_stop,
+        "Stop is wider than the stock's daily noise",
+        f"Your stop triggers on a {abs(stop_move_pct):.2f}% move; this stock "
+        f"typically moves {daily_range_pct:.1f}% a day. A stop inside that "
+        f"range gets hit on ordinary days."
+        if stop_move_pct == stop_move_pct else "Could not be computed."))
+
+    ok_be = (breakeven_move_pct == breakeven_move_pct
+             and typical_move_pct == typical_move_pct
+             and abs(breakeven_move_pct) <= typical_move_pct)
+    out.append((
+        ok_be,
+        "Breakeven is within a typical move",
+        f"You need {abs(breakeven_move_pct):.1f}% to break even; this stock "
+        f"usually covers {typical_move_pct:.1f}% over {days_to_expiry} days. "
+        f"Needing more than usual is not impossible, but the odds are against it."
+        if breakeven_move_pct == breakeven_move_pct else "Could not be computed."))
+
+    has_event = event_days is not None and event_days == event_days
+    out.append((
+        has_event,
+        "There is a reason for it to move",
+        f"Results in {int(event_days)} days."
+        if has_event else
+        "No results date found before expiry. Buying premium with no catalyst "
+        "means paying for time and hoping — decay is certain, the move is not."))
+
+    out.append((
+        bool(str(why_written).strip()),
+        "You have written down why",
+        "One sentence, before you know the outcome. Six months from now this "
+        "is the only honest record of your reasoning."))
+
+    return out
+
+
 # ============================================================== STYLING ======
 
 st.markdown("""
@@ -468,8 +612,8 @@ def tint(df, cols):
 fno = load_fno()
 hist = load_history()
 
-tab_today, tab_trade, tab_journal, tab_data = st.tabs(
-    ["Today", "Trade", "Journal", "Data"])
+tab_today, tab_trade, tab_open, tab_journal, tab_data = st.tabs(
+    ["Today", "Trade", "Open positions", "Journal", "Data"])
 
 
 with tab_today, safe("Today"):
@@ -676,11 +820,54 @@ with tab_trade, safe("Trade"):
                 f"close, not a live quote — check the bid and ask before acting."
             )
 
+            st.divider()
+            st.markdown("#### Before you place it")
+
+            cap = st.number_input("Your capital (Rs)", value=500000.0,
+                                  step=50000.0, key="tr_cap")
+            why = st.text_input(
+                "Why are you taking it?", key="tr_why",
+                placeholder="e.g. results in 6 days, options cheap vs usual move")
+
+            stop_move = float(sr["Stock move %"].iloc[0]) if len(sr) else float("nan")
+            be_move = float(row["Move needed %"])
+            typ = typical_move(hist, sym, dte) if not hist.empty else float("nan")
+            ev_days = None
+            mtg = load_meetings()
+            if not mtg.empty and "SYMBOL" in mtg.columns:
+                mine = mtg[(mtg["SYMBOL"].astype(str).str.upper() == sym.upper())
+                           & (mtg["MEETING_DATE"] >= pd.Timestamp(datetime.now().date()))
+                           & (mtg["MEETING_DATE"] <= pd.Timestamp(exp))]
+                if not mine.empty:
+                    ev_days = (mine["MEETING_DATE"].min()
+                               - pd.Timestamp(datetime.now().date())).days
+
+            checks = pre_trade_checks(entry, qty, cap, stop_move, dr, be_move,
+                                      typ, dte, ev_days, why, int(lots))
+            passed = sum(1 for ok, _, _ in checks if ok)
+
+            for ok, title, detail in checks:
+                mark = "✓" if ok else "✕"
+                colour = "#2fbf71" if ok else "#e5484d"
+                st.markdown(
+                    f'<div style="padding:0.35rem 0;border-bottom:1px solid #1c222b;">'
+                    f'<span style="color:{colour};font-weight:700;">{mark}</span> '
+                    f'<b style="color:#e6eaef;">{title}</b><br>'
+                    f'<span style="color:#8b95a1;font-size:0.84rem;margin-left:1.1rem;">'
+                    f'{detail}</span></div>', unsafe_allow_html=True)
+
+            if passed < 3:
+                st.markdown(
+                    f'<div class="bad"><b>{passed} of 5 checks pass.</b> None of '
+                    'these predicts anything — each one catches a specific way '
+                    'trades go wrong that is obvious afterwards and invisible '
+                    'beforehand. Failing three or more usually means a different '
+                    'strike, a later expiry, or no trade at all.</div>',
+                    unsafe_allow_html=True)
+            else:
+                st.caption(f"{passed} of 5 checks pass.")
+
             with st.form("log_trade", clear_on_submit=True):
-                st.markdown("**Log this trade**")
-                why = st.text_input("Why are you taking it?",
-                                    placeholder="e.g. results in 6 days, options "
-                                                "cheap vs usual move")
                 if st.form_submit_button("Add to journal") and why.strip():
                     j = load_journal()
                     new = pd.DataFrame([{
@@ -696,6 +883,104 @@ with tab_trade, safe("Trade"):
                     JOURNAL.parent.mkdir(parents=True, exist_ok=True)
                     out.to_csv(JOURNAL, index=False)
                     st.success("Logged. Download it from the Journal tab to keep it.")
+
+
+with tab_open, safe("Open positions"):
+    st.markdown("### What am I holding?")
+
+    j = load_journal()
+    open_rows = j[j["status"].astype(str).str.lower() != "closed"] if not j.empty \
+        else pd.DataFrame()
+
+    if open_rows.empty:
+        st.info("Nothing open. Log a trade on the Trade tab.")
+    else:
+        st.caption(
+            f"{len(open_rows)} open. Enter the current premium from your broker "
+            "for each — the stored data is a previous close, so anything shown "
+            "during market hours would be yesterday's price."
+        )
+        lots_map = load_lots()
+        capital = st.number_input("Your capital (Rs)", value=500000.0,
+                                  step=50000.0, key="op_cap",
+                                  help="Used to show what share of it each "
+                                       "position represents.")
+
+        cards = []
+        for i, (_, r) in enumerate(open_rows.iterrows()):
+            label = f"{r.get('symbol','')} {r.get('strike','')} {r.get('type','')}"
+            with st.container(border=True):
+                c1, c2 = st.columns([1, 3])
+                now = c1.number_input(
+                    f"{label} — premium now",
+                    value=float(pd.to_numeric(r.get("entry"), errors="coerce") or 1.0),
+                    min_value=0.05, step=0.05, key=f"op_now_{i}")
+                s = position_status(r, now, lots_map)
+                if s is None:
+                    c2.warning("This entry is missing an entry price or lot count.")
+                    continue
+                cards.append(s)
+
+                pnl_col = "#2fbf71" if s["P&L net"] >= 0 else "#e5484d"
+                flag_html = (f'<span style="color:#e5484d;font-weight:600;">'
+                             f'{s["Flags"]}</span><br>' if s["Flags"] else "")
+                c2.markdown(
+                    f'{flag_html}'
+                    f'<span style="font-size:1.35rem;font-weight:650;'
+                    f'color:{pnl_col};">Rs {s["P&L net"]:+,.0f}</span>'
+                    f'<span style="color:#8b95a1;"> ({s["Return %"]:+.0f}% '
+                    f'after costs)</span><br>'
+                    f'<span style="color:#8b95a1;font-size:0.87rem;">'
+                    f'Cost Rs {s["Cost"]:,.0f} · now worth Rs {s["Value"]:,.0f} · '
+                    f'{s["Days left"] if s["Days left"] is not None else "?"} days '
+                    f'to expiry<br>'
+                    f'Target {s["Target"]:.2f} ({s["To target %"]:+.0f}% away) · '
+                    f'Stop {s["Stop"]:.2f} ({s["To stop %"]:+.0f}% away)</span>',
+                    unsafe_allow_html=True)
+                if s["Toward"] != "—":
+                    c2.progress(min(s["Progress %"] / 100, 1.0),
+                                text=f"{s['Progress %']:.0f}% of the way to your "
+                                     f"{s['Toward']}")
+                if s["Why"]:
+                    c2.caption(f"You wrote: {s['Why']}")
+
+        if cards:
+            summary = pd.DataFrame(cards)
+            st.divider()
+            t1, t2, t3, t4 = st.columns(4)
+            total_cost = summary["Cost"].sum()
+            total_pnl = summary["P&L net"].sum()
+            t1.metric("Deployed", f"Rs {total_cost:,.0f}",
+                      help=f"{total_cost / capital * 100:.1f}% of capital"
+                           if capital else None)
+            t2.metric("Open P&L", f"Rs {total_pnl:+,.0f}")
+            t3.metric("Positions", len(summary))
+            near = summary[summary["Days left"].fillna(99) <= 5]
+            t4.metric("Expiring within 5 days", len(near))
+
+            if total_cost > capital * 0.1 and capital:
+                st.markdown(
+                    f'<div class="note">You have {total_cost / capital * 100:.0f}% '
+                    'of capital in open option positions. Bought options can go '
+                    'to zero together — they are not independent bets when the '
+                    'whole market moves against you.</div>',
+                    unsafe_allow_html=True)
+            if len(near):
+                st.markdown(
+                    f'<div class="note"><b>{len(near)} position(s) expire within '
+                    'five days.</b> Time decay accelerates sharply in the final '
+                    'week — an option that has not worked by now usually will '
+                    'not, and the last days lose value fastest.</div>',
+                    unsafe_allow_html=True)
+
+            st.dataframe(
+                tint(summary[["Symbol", "Contract", "Days left", "Entry", "Now",
+                              "Target", "Stop", "Cost", "P&L net", "Return %",
+                              "Flags"]], ["P&L net", "Return %"]),
+                use_container_width=True, hide_index=True)
+
+        st.caption("Mark positions closed on the Journal tab once you exit, so "
+                   "they count toward your record.")
 
 
 with tab_journal, safe("Journal"):

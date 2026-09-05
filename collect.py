@@ -51,15 +51,47 @@ HIST_COLS = ["DATE", "SYMBOL", "OPEN", "HIGH", "LOW", "CLOSE", "PREV_CLOSE",
              "VOLUME", "DELIV_PER"]
 
 
-def client() -> httpx.Client:
-    """Cookie-primed client. NSE rejects requests without a prior page visit."""
-    c = httpx.Client(http2=True, headers=HEADERS, timeout=30.0,
-                     follow_redirects=True)
-    c.get(BASE)
-    time.sleep(0.5)
-    c.get(f"{BASE}/market-data/live-equity-market")
-    time.sleep(0.5)
-    return c
+def client(attempts: int = 3):
+    """
+    Cookie-primed client. NSE rejects requests without a prior page visit.
+
+    Every call is guarded. The previous version let a connection error during
+    priming escape, which killed the whole script with a raw traceback before
+    a single line of useful output. Network calls to NSE fail often enough
+    that this has to be handled rather than assumed.
+
+    HTTP/2 is tried first because NSE fingerprints plain HTTP/1.1 clients, but
+    HTTP/2 itself sometimes breaks from CI runners — so both are attempted.
+    """
+    last = ""
+    for attempt in range(attempts):
+        for use_h2 in (True, False):
+            try:
+                c = httpx.Client(http2=use_h2, headers=HEADERS, timeout=30.0,
+                                 follow_redirects=True)
+                r = c.get(BASE)
+                if r.status_code >= 400:
+                    last = f"homepage returned HTTP {r.status_code}"
+                    c.close()
+                    continue
+                time.sleep(0.6)
+                c.get(f"{BASE}/market-data/live-equity-market")
+                time.sleep(0.6)
+                print(f"  session established (HTTP/{'2' if use_h2 else '1.1'})")
+                return c
+            except Exception as exc:  # noqa: BLE001
+                last = f"{type(exc).__name__}: {str(exc)[:70]}"
+                try:
+                    c.close()
+                except Exception:
+                    pass
+        if attempt < attempts - 1:
+            wait = 3 * (attempt + 1)
+            print(f"  handshake failed ({last}) — retrying in {wait}s")
+            time.sleep(wait)
+
+    print(f"  could not reach NSE after {attempts} attempts: {last}")
+    return None
 
 
 def clean(df: pd.DataFrame) -> pd.DataFrame:
@@ -210,62 +242,99 @@ def main() -> int:
                     help="Calendar days of price history to seed")
     args = ap.parse_args()
 
+    print("Connecting to NSE…")
     cl = client()
+    if cl is None:
+        print("\nNothing collected — NSE could not be reached at all. This is "
+              "usually temporary; try again in a few minutes. If it persists, "
+              "NSE is refusing this runner and the collector needs to run "
+              "somewhere else.")
+        return 1
 
-    # --- F&O: only the newest trading day is needed, so walk back until found
-    print("F&O chains…")
-    for off in range(6):
-        day = datetime.now() - timedelta(days=off)
-        if day.weekday() >= 5:
-            continue
-        df, note = fetch_fno(cl, day)
-        if df is None:
-            print(f"  {day:%Y-%m-%d}: {note}")
-            time.sleep(0.4)
-            continue
-        opts = df[df["TYPE"].isin(["STO", "IDO"])] if "TYPE" in df else df
-        print(f"  {day:%Y-%m-%d}: {len(df):,} contracts, "
-              f"{df['SYMBOL'].nunique()} underlyings, {len(opts):,} options")
-        store_month(FNO_DIR, df)
-        if "LOT_SIZE" in df.columns:
-            lots = df.dropna(subset=["LOT_SIZE"]).groupby("SYMBOL")["LOT_SIZE"].max()
-            lots.reset_index().to_csv(LOTS, index=False)
-            print(f"  lot sizes: {len(lots)} underlyings")
-        break
-    else:
-        print("  no F&O file found in the last six days")
+    done = {"fno": False, "history": 0, "meetings": 0}
 
-    # --- price history, newest first so recent days are never missed
-    days_back = args.backfill or 6
-    have = stored_dates(HIST_DIR)
-    print(f"\nPrice history ({len(have)} days already stored)…")
-    got = miss = 0
-    for off in range(days_back):
-        day = datetime.now() - timedelta(days=off)
-        if day.weekday() >= 5 or day.strftime("%Y-%m-%d") in have:
-            continue
-        df, note = fetch_equity(cl, day)
-        if df is None:
-            miss += 1
-            if got == 0 and miss >= 10:
-                print("  ten most recent days all failed — stopping")
-                break
-            if got > 0 and miss > 30:
-                print(f"  past the end of NSE's archive after {got} new day(s)")
-                break
+    # --- F&O: only the newest trading day is needed
+    print("\nF&O chains…")
+    try:
+        for off in range(6):
+            day = datetime.now() - timedelta(days=off)
+            if day.weekday() >= 5:
+                continue
+            df, note = fetch_fno(cl, day)
+            if df is None:
+                print(f"  {day:%Y-%m-%d}: {note}")
+                time.sleep(0.4)
+                continue
+            opts = df[df["TYPE"].isin(["STO", "IDO"])] if "TYPE" in df else df
+            print(f"  {day:%Y-%m-%d}: {len(df):,} contracts, "
+                  f"{df['SYMBOL'].nunique()} underlyings, {len(opts):,} options")
+            store_month(FNO_DIR, df)
+            if "LOT_SIZE" in df.columns:
+                lots = df.dropna(subset=["LOT_SIZE"]).groupby("SYMBOL")["LOT_SIZE"].max()
+                LOTS.parent.mkdir(parents=True, exist_ok=True)
+                lots.reset_index().to_csv(LOTS, index=False)
+                print(f"  lot sizes: {len(lots)} underlyings")
+            done["fno"] = True
+            break
         else:
-            store_month(HIST_DIR, df, HIST_COLS)
-            got += 1
-            miss = 0
-            print(f"  {day:%Y-%m-%d}: {len(df):,} stocks")
-        time.sleep(0.35)
-    print(f"  {got} new day(s) stored")
+            print("  no F&O file found in the last six days")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  F&O collection failed: {type(exc).__name__}: {str(exc)[:90]}")
+
+    # --- price history, newest first
+    print("\nPrice history…")
+    try:
+        days_back = args.backfill or 6
+        have = stored_dates(HIST_DIR)
+        print(f"  {len(have)} day(s) already stored")
+        got = miss = 0
+        for off in range(days_back):
+            day = datetime.now() - timedelta(days=off)
+            if day.weekday() >= 5 or day.strftime("%Y-%m-%d") in have:
+                continue
+            try:
+                df, note = fetch_equity(cl, day)
+            except Exception as exc:  # noqa: BLE001
+                df, note = None, f"{type(exc).__name__}"
+            if df is None:
+                miss += 1
+                if got == 0 and miss >= 10:
+                    print(f"  the ten most recent days all failed ({note}) — stopping")
+                    break
+                if got > 0 and miss > 30:
+                    print(f"  past the end of NSE's archive after {got} new day(s)")
+                    break
+            else:
+                store_month(HIST_DIR, df, HIST_COLS)
+                got += 1
+                miss = 0
+                if got % 10 == 0 or got == 1:
+                    print(f"  {day:%Y-%m-%d}: {len(df):,} stocks ({got} so far)")
+            time.sleep(0.35)
+        done["history"] = got
+        print(f"  {got} new day(s) stored")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  history collection failed: {type(exc).__name__}: {str(exc)[:90]}")
 
     print("\nResults calendar…")
-    collect_meetings(cl)
-    cl.close()
+    try:
+        done["meetings"] = collect_meetings(cl)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  meetings failed: {type(exc).__name__}: {str(exc)[:90]}")
 
-    print("\nDone.")
+    try:
+        cl.close()
+    except Exception:
+        pass
+
+    print(f"\nSummary: F&O {'ok' if done['fno'] else 'MISSING'} · "
+          f"{done['history']} new price day(s) · {done['meetings']} meeting rows")
+
+    # The app is usable with F&O alone, so only a total failure is an error.
+    if not done["fno"] and done["history"] == 0:
+        print("Nothing was collected. Re-run — NSE refuses requests "
+              "intermittently and a retry often succeeds.")
+        return 1
     return 0
 
 

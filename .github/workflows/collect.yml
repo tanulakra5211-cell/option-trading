@@ -1,0 +1,43 @@
+name: Collect
+
+# Weekday evenings, after NSE publishes. 14:00 UTC = 19:30 IST.
+on:
+  schedule:
+    - cron: '0 14 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      backfill:
+        description: 'Days of price history to seed (blank for daily run)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install "httpx[http2]" pandas
+      - name: Collect
+        run: |
+          if [ -n "${{ github.event.inputs.backfill }}" ]; then
+            python collect.py --backfill ${{ github.event.inputs.backfill }}
+          else
+            python collect.py
+          fi
+      - name: Commit
+        run: |
+          git config user.name  "collector"
+          git config user.email "actions@github.com"
+          git add data/
+          if git diff --staged --quiet; then
+            echo "Nothing new."
+          else
+            git commit -m "Data: $(date -u +%Y-%m-%d)"
+            git push
+          fi

@@ -24,7 +24,7 @@ import streamlit as st
 st.set_page_config(page_title="Options Desk", page_icon="◆", layout="wide",
                    initial_sidebar_state="collapsed")
 
-VERSION = "v7"
+VERSION = "v8"
 DATA = Path(__file__).parent / "data"
 FNO_DIR = DATA / "fno"
 HIST_DIR = DATA / "history"
@@ -991,6 +991,139 @@ def strikes_for_candidate(fno: pd.DataFrame, symbol: str, expiry, spot: float,
     return pd.DataFrame(rows)
 
 
+# ====================================================== DIRECTIONAL SIGNAL ===
+# A call, with its track record attached.
+#
+# The signal is a weighted vote of measurable things — trend, momentum,
+# mean reversion, momentum extremes. What makes it usable rather than
+# decoration is that the same rule is run over the stored history and its hit
+# rate reported next to it. A "Bullish" that has been right 51% of the time is
+# a coin flip, and the app says so rather than letting the word do the work.
+
+def direction_signal(hist: pd.DataFrame, symbol: str, horizon: int = 10) -> dict:
+    """Directional lean for one stock from its own price history."""
+    g = hist[hist["SYMBOL"] == symbol].sort_values("DATE")
+    c = g["CLOSE"].dropna().reset_index(drop=True)
+    if len(c) < 210:
+        return {"error": "needs 210 trading days of history for this stock"}
+
+    last = float(c.iloc[-1])
+    sma50 = float(c.rolling(50).mean().iloc[-1])
+    sma200 = float(c.rolling(200).mean().iloc[-1])
+
+    delta = c.diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    rsi = float((100 - (100 / (1 + gain / loss.replace(0, float("nan"))))).iloc[-1])
+
+    ret1m = ((last / float(c.iloc[-22])) - 1) * 100 if len(c) > 22 else 0.0
+    ret3m = ((last / float(c.iloc[-64])) - 1) * 100 if len(c) > 64 else 0.0
+
+    reasons, score = [], 0
+    if last > sma200:
+        score += 2; reasons.append("above the 200-day average")
+    else:
+        score -= 2; reasons.append("below the 200-day average")
+    if last > sma50:
+        score += 1; reasons.append("above the 50-day")
+    else:
+        score -= 1; reasons.append("below the 50-day")
+    if ret1m > 3:
+        score += 1; reasons.append(f"up {ret1m:.0f}% in a month")
+    elif ret1m < -3:
+        score -= 1; reasons.append(f"down {abs(ret1m):.0f}% in a month")
+    if rsi < 30:
+        score += 2; reasons.append(f"oversold at RSI {rsi:.0f}")
+    elif rsi > 70:
+        score -= 1; reasons.append(f"overbought at RSI {rsi:.0f}")
+    if ret3m > 10 and last > sma50:
+        score += 1; reasons.append("sustained three-month strength")
+
+    if score >= 3:
+        call = "Bullish"
+    elif score <= -3:
+        call = "Bearish"
+    else:
+        call = "No clear view"
+
+    return {"call": call, "score": score, "reasons": reasons,
+            "rsi": rsi, "spot": last, "ret1m": ret1m}
+
+
+def signal_accuracy(hist: pd.DataFrame, horizon: int = 10,
+                    max_symbols: int = 100) -> dict:
+    """
+    How often that exact rule has been right, on this data.
+
+    Walks the history, applies the same scoring at each point, and records
+    what followed. The base rate is reported alongside because a 55% hit rate
+    means nothing if the stocks rose 55% of the time regardless.
+    """
+    if hist.empty:
+        return {}
+    wide = hist.pivot_table(index="DATE", columns="SYMBOL", values="CLOSE",
+                            aggfunc="last").sort_index()
+    if len(wide) < 220 + horizon:
+        return {"error": f"needs about {220 + horizon} trading days, "
+                         f"has {len(wide)}"}
+
+    bull, bear, base = [], [], []
+    for sym in list(wide.columns)[:max_symbols]:
+        c = wide[sym].dropna()
+        if len(c) < 210 + horizon:
+            continue
+        sma50 = c.rolling(50).mean()
+        sma200 = c.rolling(200).mean()
+        d = c.diff()
+        g_ = d.clip(lower=0).rolling(14).mean()
+        l_ = (-d.clip(upper=0)).rolling(14).mean()
+        rsi = 100 - (100 / (1 + g_ / l_.replace(0, float("nan"))))
+        r1m = (c / c.shift(22) - 1) * 100
+        r3m = (c / c.shift(64) - 1) * 100
+        fwd = (c.shift(-horizon) / c - 1) * 100
+
+        sc = ((c > sma200).astype(int) * 2 - (c <= sma200).astype(int) * 2
+              + (c > sma50).astype(int) - (c <= sma50).astype(int)
+              + (r1m > 3).astype(int) - (r1m < -3).astype(int)
+              + (rsi < 30).astype(int) * 2 - (rsi > 70).astype(int)
+              + ((r3m > 10) & (c > sma50)).astype(int))
+
+        valid = fwd.notna() & sc.notna() & sma200.notna()
+        base.extend(fwd[valid].tolist())
+        # Sample every `horizon` days so overlapping windows are not counted
+        # as independent observations.
+        idx = list(range(0, len(c), max(horizon, 1)))
+        sub = valid.iloc[idx]
+        for pos in sub[sub].index:
+            s, f = sc.get(pos), fwd.get(pos)
+            if s != s or f != f:
+                continue
+            if s >= 3:
+                bull.append(float(f))
+            elif s <= -3:
+                bear.append(float(f))
+
+    if not bull and not bear:
+        return {"error": "no historical instances of a clear call"}
+
+    b_ = pd.Series(base)
+    out = {"base_hit": float((b_ > 0).mean() * 100),
+           "base_median": float(b_.median()), "horizon": horizon}
+    if bull:
+        s = pd.Series(bull)
+        out["bull_n"] = len(s)
+        out["bull_hit"] = float((s > 0).mean() * 100)
+        out["bull_median"] = float(s.median())
+        out["bull_edge"] = out["bull_hit"] - out["base_hit"]
+    if bear:
+        s = pd.Series(bear)
+        out["bear_n"] = len(s)
+        out["bear_hit"] = float((s < 0).mean() * 100)
+        out["bear_median"] = float(s.median())
+        out["bear_edge"] = out["bear_hit"] - (100 - out["base_hit"])
+    return out
+
+
 # ============================================================== STYLING ======
 
 st.markdown("""
@@ -1106,6 +1239,39 @@ with tab_today, safe("Today"):
                     f'{". ".join(bits) if bits else "Liquid, no catalyst found"}.'
                     f'</span></div>', unsafe_allow_html=True)
 
+                sig = direction_signal(hist, r["Symbol"]) if not hist.empty else {}
+                if sig and "error" not in sig:
+                    colour = {"Bullish": "#2fbf71", "Bearish": "#e5484d",
+                              "No clear view": "#8b95a1"}[sig["call"]]
+                    acc = st.session_state.get("_sig_acc")
+                    if acc and "error" not in acc:
+                        if sig["call"] == "Bullish" and "bull_hit" in acc:
+                            track = (f"This call has been right "
+                                     f"<b>{acc['bull_hit']:.0f}%</b> of the time on "
+                                     f"your data, against a base rate of "
+                                     f"{acc['base_hit']:.0f}% — an edge of "
+                                     f"{acc['bull_edge']:+.1f} points.")
+                        elif sig["call"] == "Bearish" and "bear_hit" in acc:
+                            track = (f"This call has been right "
+                                     f"<b>{acc['bear_hit']:.0f}%</b> of the time on "
+                                     f"your data, against {100 - acc['base_hit']:.0f}% "
+                                     f"— an edge of {acc['bear_edge']:+.1f} points.")
+                        else:
+                            track = "No track record for this call type yet."
+                    else:
+                        track = ("Press <i>Measure how often these calls are "
+                                 "right</i> below to see the track record.")
+                    st.markdown(
+                        f'<div style="border-left:3px solid {colour};'
+                        f'padding:0.6rem 0.95rem;background:#151a21;'
+                        f'margin:-0.2rem 0 0.6rem;color:#e6eaef;">'
+                        f'<b style="color:{colour};font-size:1.02rem;">'
+                        f'{sig["call"]}</b>'
+                        f'<span style="color:#8b95a1;font-size:0.85rem;"> — '
+                        f'{", ".join(sig["reasons"][:3])}.</span><br>'
+                        f'<span style="color:#8b95a1;font-size:0.82rem;">{track}'
+                        f'</span></div>', unsafe_allow_html=True)
+
                 lot = lots_map.get(r["Symbol"], 1)
                 ladder = strikes_for_candidate(
                     fno, r["Symbol"], r["Expiry"], r["Spot"],
@@ -1184,6 +1350,70 @@ with tab_today, safe("Today"):
                 st.dataframe(
                     tint(cands, ["Options price a move of", "It usually moves"]),
                     use_container_width=True, hide_index=True)
+
+            st.divider()
+            st.markdown("#### How often is the call right?")
+            st.caption(
+                "The same rule applied across your whole stored history, with "
+                "the base rate alongside. A call that is right 51% of the time "
+                "when stocks rise 51% of the time anyway is not a call."
+            )
+            if st.button("Measure how often these calls are right", key="sig_go"):
+                with st.spinner("Walking the history…"):
+                    st.session_state["_sig_acc"] = signal_accuracy(hist, 10)
+                st.rerun()
+
+            acc = st.session_state.get("_sig_acc")
+            if acc:
+                if "error" in acc:
+                    st.warning(acc["error"])
+                else:
+                    a1, a2, a3 = st.columns(3)
+                    if "bull_hit" in acc:
+                        a1.metric("Bullish calls right",
+                                  f"{acc['bull_hit']:.0f}%",
+                                  delta=f"{acc['bull_edge']:+.1f}pp vs base",
+                                  help=f"{acc['bull_n']} instances over "
+                                       f"{acc['horizon']} days")
+                    if "bear_hit" in acc:
+                        a2.metric("Bearish calls right",
+                                  f"{acc['bear_hit']:.0f}%",
+                                  delta=f"{acc['bear_edge']:+.1f}pp vs base",
+                                  help=f"{acc['bear_n']} instances")
+                    a3.metric("Base rate", f"{acc['base_hit']:.0f}%",
+                              help="How often these stocks rose over the same "
+                                   "window regardless of any signal.")
+
+                    edges = [acc.get("bull_edge", 0), acc.get("bear_edge", 0)]
+                    best = max(edges)
+                    if best < 2:
+                        st.markdown(
+                            '<div class="bad"><b>These calls are not beating the '
+                            'base rate.</b> On your data the direction the rule '
+                            'gives is about as reliable as assuming every stock '
+                            'goes up. Treat every "Bullish" and "Bearish" above '
+                            'as decoration and use the strike table instead — '
+                            'that part is arithmetic and does not depend on '
+                            'getting direction right.</div>',
+                            unsafe_allow_html=True)
+                    elif best < 5:
+                        st.markdown(
+                            f'<div class="note"><b>A small edge of '
+                            f'{best:+.1f} points.</b> Real but thin, and thin '
+                            f'edges disappear into costs — at roughly 3% round '
+                            f'trip on options you need considerably more than '
+                            f'this to profit from direction alone.</div>',
+                            unsafe_allow_html=True)
+                    else:
+                        st.markdown(
+                            f'<div class="card"><b>An edge of {best:+.1f} points '
+                            f'over the base rate.</b><br><span style="color:#8b95a1;'
+                            f'font-size:0.86rem;">Worth paying attention to, with '
+                            f'two caveats: it is one market regime — the period '
+                            f'you happen to have collected — and the rule was not '
+                            f'tested out of sample, so some of this is the rule '
+                            f'fitting the data it was measured on.</span></div>',
+                            unsafe_allow_html=True)
 
             st.markdown(
                 '<div class="note"><b>Cheapness below 1 means the market is '

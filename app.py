@@ -24,7 +24,7 @@ import streamlit as st
 st.set_page_config(page_title="Options Desk", page_icon="◆", layout="wide",
                    initial_sidebar_state="collapsed")
 
-VERSION = "v8"
+VERSION = "v9"
 DATA = Path(__file__).parent / "data"
 FNO_DIR = DATA / "fno"
 HIST_DIR = DATA / "history"
@@ -1277,79 +1277,78 @@ with tab_today, safe("Today"):
                     fno, r["Symbol"], r["Expiry"], r["Spot"],
                     fno["DATE"].iloc[0], r["It usually moves"], lot)
 
-                with st.expander(f"Strikes for {r['Symbol']}"):
-                    if ladder.empty:
-                        st.caption("No strikes here could be priced — they may "
-                                   "not have traded.")
-                    else:
-                        reachable = ladder[ladder["Reachable"] == True]  # noqa: E712
-                        if len(reachable):
-                            best_c = reachable[reachable["Type"] == "CE"]
-                            best_p = reachable[reachable["Type"] == "PE"]
-                            picks = []
-                            if len(best_c):
-                                b = best_c.loc[best_c["Move needed %"].abs().idxmin()]
-                                picks.append(
-                                    f"<b>If you think it rises:</b> the "
-                                    f"{b['Strike']:,.0f} CE at Rs {b['Premium']:.2f} "
-                                    f"needs only {abs(b['Move needed %']):.1f}% "
-                                    f"— Rs {b['Cost per lot']:,.0f} a lot")
-                            if len(best_p):
-                                b = best_p.loc[best_p["Move needed %"].abs().idxmin()]
-                                picks.append(
-                                    f"<b>If you think it falls:</b> the "
-                                    f"{b['Strike']:,.0f} PE at Rs {b['Premium']:.2f} "
-                                    f"needs only {abs(b['Move needed %']):.1f}% "
-                                    f"— Rs {b['Cost per lot']:,.0f} a lot")
-                            st.markdown(
-                                '<div class="card">'
-                                + "<br><br>".join(picks)
-                                + f'<br><br><span style="color:#8b95a1;'
-                                  f'font-size:0.84rem;">Both are listed because '
-                                  f'nothing here tells you which way it goes. '
-                                  f'These are simply the strikes whose breakeven '
-                                  f'sits inside the {r["It usually moves"]:.1f}% '
-                                  f'this stock typically covers in {int(r["Days"])} '
-                                  f'days — the ones that can work, not the ones '
-                                  f'that will.</span></div>',
-                                unsafe_allow_html=True)
-                        else:
-                            st.markdown(
-                                f'<div class="note">No strike here has a '
-                                f'breakeven within the {r["It usually moves"]:.1f}% '
-                                f'this stock typically covers. Every one needs a '
-                                f'bigger-than-usual move to pay off, which is a '
-                                f'reason to look elsewhere rather than to pick '
-                                f'the cheapest.</div>', unsafe_allow_html=True)
+                # One direction only. The signal decides which side to show —
+                # listing both was hedging, and a call you have to choose
+                # between is not a call.
+                side = ("CE" if sig.get("call") == "Bullish"
+                        else "PE" if sig.get("call") == "Bearish" else None)
 
-                        show = ladder.copy()
-                        show["Reachable"] = show["Reachable"].map(
-                            {True: "yes", False: "no"}).fillna("—")
+                if side is None:
+                    st.caption(
+                        f"No clear direction on {r['Symbol']} — the trend, "
+                        f"momentum and momentum-extreme readings disagree. "
+                        f"Cheap options with no directional read are not a "
+                        f"trade; skip it."
+                    )
+                    continue
+
+                with st.expander(
+                        f"{'Calls' if side == 'CE' else 'Puts'} on {r['Symbol']}",
+                        expanded=True):
+                    one = ladder[ladder["Type"] == side]
+                    reach = one[one["Reachable"] == True]  # noqa: E712
+
+                    if one.empty:
+                        st.caption("No strikes on this side could be priced.")
+                    elif reach.empty:
+                        st.markdown(
+                            f'<div class="note">Every {side} strike here needs a '
+                            f'bigger move than the {r["It usually moves"]:.1f}% '
+                            f'this stock typically covers in {int(r["Days"])} '
+                            f'days. Nothing to take.</div>',
+                            unsafe_allow_html=True)
+                    else:
+                        # Prefer the reachable strike with the best balance of
+                        # cost and chance — not simply the cheapest, which is
+                        # cheap because it rarely pays.
+                        cand = reach[reach["Chance ITM %"] >= 35]
+                        pick = (cand.loc[cand["Cost per lot"].idxmin()]
+                                if len(cand) else
+                                reach.loc[reach["Move needed %"].abs().idxmin()])
+
+                        st.markdown(
+                            f'<div class="card">'
+                            f'<b style="font-size:1.15rem;">Buy the '
+                            f'{pick["Strike"]:,.0f} {side}</b><br>'
+                            f'<span style="font-size:1.02rem;color:#e6eaef;">'
+                            f'at Rs {pick["Premium"]:.2f} · '
+                            f'Rs {pick["Cost per lot"]:,.0f} for one lot of {lot}'
+                            f'</span><br>'
+                            f'<span style="color:#8b95a1;font-size:0.86rem;">'
+                            f'Needs {abs(pick["Move needed %"]):.1f}% to break '
+                            f'even, against the {r["It usually moves"]:.1f}% this '
+                            f'stock typically covers by expiry. Roughly '
+                            f'{pick["Chance ITM %"]:.0f}% chance of finishing in '
+                            f'the money.</span></div>',
+                            unsafe_allow_html=True)
+
                         st.dataframe(
-                            tint(show, ["Move needed %"]),
+                            tint(one.drop(columns=["Type", "Reachable"]),
+                                 ["Move needed %"]),
                             column_config={
                                 "Strike": st.column_config.NumberColumn(format="%.0f"),
                                 "Premium": st.column_config.NumberColumn(format="%.2f"),
                                 "Cost per lot": st.column_config.NumberColumn(format="%.0f"),
-                                "Move needed %": st.column_config.NumberColumn(
-                                    format="%.1f%%",
-                                    help="How far the stock must travel for this "
-                                         "to break even at expiry."),
-                                "Reachable": st.column_config.TextColumn(
-                                    help="Whether that move is within what this "
-                                         "stock typically covers by expiry."),
+                                "Move needed %": st.column_config.NumberColumn(format="%.1f%%"),
                                 "Chance ITM %": st.column_config.NumberColumn(format="%.0f%%"),
                                 "IV %": st.column_config.NumberColumn(format="%.1f"),
                             },
                             use_container_width=True, hide_index=True)
                         st.caption(
-                            f"Lot size {lot}. Take a strike to the **Trade** tab "
-                            "for entry, target and stop in premium terms.")
-
-            with st.expander("Full list"):
-                st.dataframe(
-                    tint(cands, ["Options price a move of", "It usually moves"]),
-                    use_container_width=True, hide_index=True)
+                            f"Other {'call' if side == 'CE' else 'put'} strikes "
+                            f"for comparison. Take one to the **Trade** tab for "
+                            f"entry, target and stop."
+                        )
 
             st.divider()
             st.markdown("#### How often is the call right?")

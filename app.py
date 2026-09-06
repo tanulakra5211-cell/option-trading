@@ -24,7 +24,7 @@ import streamlit as st
 st.set_page_config(page_title="Options Desk", page_icon="◆", layout="wide",
                    initial_sidebar_state="collapsed")
 
-VERSION = "v5"
+VERSION = "v7"
 DATA = Path(__file__).parent / "data"
 FNO_DIR = DATA / "fno"
 HIST_DIR = DATA / "history"
@@ -945,6 +945,52 @@ def pattern_outcomes(hist: pd.DataFrame, pattern: str, horizon: int = 10,
     }
 
 
+def strikes_for_candidate(fno: pd.DataFrame, symbol: str, expiry, spot: float,
+                          snap, typical_pct: float, lot: int, n: int = 4):
+    """
+    Calls and puts around the money, with the one thing that decides between
+    them: whether the breakeven is inside what this stock actually covers.
+
+    A strike needing a 9% move on a stock that typically manages 5% is cheap
+    for a reason. Flagging that is a statement about arithmetic, not direction
+    — both the call and the put are shown, because which one to buy depends on
+    a view the data cannot supply.
+    """
+    g = fno[(fno["SYMBOL"] == symbol)
+            & (fno["EXPIRY_DT"] == pd.Timestamp(expiry))
+            & (fno["OPT"].isin(["CE", "PE"]))].copy()
+    if g.empty:
+        return pd.DataFrame()
+
+    dte = max((pd.Timestamp(expiry) - pd.Timestamp(snap)).days, 1)
+    t = dte / 365.0
+    rows = []
+    for opt in ("CE", "PE"):
+        side = g[g["OPT"] == opt]
+        if side.empty:
+            continue
+        near = side.iloc[(side["STRIKE"] - spot).abs().argsort()[:n]]
+        for _, r in near.sort_values("STRIKE").iterrows():
+            k, prem = float(r["STRIKE"]), float(r["CLOSE"])
+            iv = implied_vol(prem, spot, k, t, opt == "CE")
+            if iv != iv:
+                continue
+            gk = greeks(spot, k, t, iv / 100, opt == "CE")
+            be = k + prem if opt == "CE" else k - prem
+            need = ((be - spot) / spot) * 100
+            rows.append({
+                "Type": opt, "Strike": k, "Premium": prem,
+                "Cost per lot": prem * lot,
+                "Move needed %": need,
+                "Reachable": (abs(need) <= typical_pct
+                              if typical_pct == typical_pct else None),
+                "Chance ITM %": abs(gk["delta"]) * 100,
+                "IV %": iv,
+                "OI": r.get("OI", float("nan")),
+            })
+    return pd.DataFrame(rows)
+
+
 # ============================================================== STYLING ======
 
 st.markdown("""
@@ -986,6 +1032,31 @@ def tint(df, cols):
 fno = load_fno()
 hist = load_history()
 
+
+def data_banner():
+    """
+    A one-line statement of what the app can actually see.
+
+    Without this an empty tab is ambiguous: no data, or something broken?
+    Stating it on every screen removes the guesswork.
+    """
+    bits = []
+    bits.append(f"F&O: {fno['SYMBOL'].nunique()} stocks" if not fno.empty
+                else "F&O: **missing**")
+    if hist.empty:
+        bits.append("History: **missing**")
+    else:
+        bits.append(f"History: {hist['DATE'].nunique()} days, "
+                    f"{hist['SYMBOL'].nunique()} stocks")
+    st.caption(f"Options Desk {VERSION} · " + " · ".join(bits))
+    if fno.empty or hist.empty:
+        st.markdown(
+            '<div class="note">Some data has not loaded. Run the <i>Collect</i> '
+            'workflow in your repo, then reboot the app from share.streamlit.io '
+            '— Streamlit does not pick up newly committed files on its own. '
+            'The Data tab shows exactly what is present.</div>',
+            unsafe_allow_html=True)
+
 (tab_today, tab_falls, tab_trade, tab_open, tab_journal, tab_patterns,
  tab_data) = st.tabs(["Today", "Unfair falls", "Trade", "Open positions",
                       "Journal", "Patterns", "Data"])
@@ -993,6 +1064,7 @@ hist = load_history()
 
 with tab_today, safe("Today"):
     st.markdown("### Is anything worth trading?")
+    data_banner()
     st.caption(
         "Stock options where the market is pricing a smaller move than the "
         "stock usually makes, with a results date coming. No view on direction "
@@ -1014,16 +1086,17 @@ with tab_today, safe("Today"):
             top = cands.head(5)
             st.caption(f"Top 5 of {len(cands)} liquid underlyings.")
 
+            lots_map = load_lots()
             for _, r in top.iterrows():
                 cheap = r["Cheapness"]
                 ev = r["Results in"]
                 bits = []
                 if cheap == cheap:
                     bits.append(
-                        f"Options price a **{r['Options price a move of']:.1f}%** "
-                        f"move; it usually does **{r['It usually moves']:.1f}%**")
+                        f"Options price a <b>{r['Options price a move of']:.1f}%</b> "
+                        f"move; it usually does <b>{r['It usually moves']:.1f}%</b>")
                 if ev is not None and pd.notna(ev):
-                    bits.append(f"results in **{int(ev)} days**"
+                    bits.append(f"results in <b>{int(ev)} days</b>"
                                 + (" — before expiry" if ev <= r["Days"] else ""))
                 st.markdown(
                     f'<div class="card"><b style="font-size:1.05rem;">{r["Symbol"]}</b>'
@@ -1032,6 +1105,80 @@ with tab_today, safe("Today"):
                     f'<span style="color:#8b95a1;font-size:0.87rem;">'
                     f'{". ".join(bits) if bits else "Liquid, no catalyst found"}.'
                     f'</span></div>', unsafe_allow_html=True)
+
+                lot = lots_map.get(r["Symbol"], 1)
+                ladder = strikes_for_candidate(
+                    fno, r["Symbol"], r["Expiry"], r["Spot"],
+                    fno["DATE"].iloc[0], r["It usually moves"], lot)
+
+                with st.expander(f"Strikes for {r['Symbol']}"):
+                    if ladder.empty:
+                        st.caption("No strikes here could be priced — they may "
+                                   "not have traded.")
+                    else:
+                        reachable = ladder[ladder["Reachable"] == True]  # noqa: E712
+                        if len(reachable):
+                            best_c = reachable[reachable["Type"] == "CE"]
+                            best_p = reachable[reachable["Type"] == "PE"]
+                            picks = []
+                            if len(best_c):
+                                b = best_c.loc[best_c["Move needed %"].abs().idxmin()]
+                                picks.append(
+                                    f"<b>If you think it rises:</b> the "
+                                    f"{b['Strike']:,.0f} CE at Rs {b['Premium']:.2f} "
+                                    f"needs only {abs(b['Move needed %']):.1f}% "
+                                    f"— Rs {b['Cost per lot']:,.0f} a lot")
+                            if len(best_p):
+                                b = best_p.loc[best_p["Move needed %"].abs().idxmin()]
+                                picks.append(
+                                    f"<b>If you think it falls:</b> the "
+                                    f"{b['Strike']:,.0f} PE at Rs {b['Premium']:.2f} "
+                                    f"needs only {abs(b['Move needed %']):.1f}% "
+                                    f"— Rs {b['Cost per lot']:,.0f} a lot")
+                            st.markdown(
+                                '<div class="card">'
+                                + "<br><br>".join(picks)
+                                + f'<br><br><span style="color:#8b95a1;'
+                                  f'font-size:0.84rem;">Both are listed because '
+                                  f'nothing here tells you which way it goes. '
+                                  f'These are simply the strikes whose breakeven '
+                                  f'sits inside the {r["It usually moves"]:.1f}% '
+                                  f'this stock typically covers in {int(r["Days"])} '
+                                  f'days — the ones that can work, not the ones '
+                                  f'that will.</span></div>',
+                                unsafe_allow_html=True)
+                        else:
+                            st.markdown(
+                                f'<div class="note">No strike here has a '
+                                f'breakeven within the {r["It usually moves"]:.1f}% '
+                                f'this stock typically covers. Every one needs a '
+                                f'bigger-than-usual move to pay off, which is a '
+                                f'reason to look elsewhere rather than to pick '
+                                f'the cheapest.</div>', unsafe_allow_html=True)
+
+                        show = ladder.copy()
+                        show["Reachable"] = show["Reachable"].map(
+                            {True: "yes", False: "no"}).fillna("—")
+                        st.dataframe(
+                            tint(show, ["Move needed %"]),
+                            column_config={
+                                "Strike": st.column_config.NumberColumn(format="%.0f"),
+                                "Premium": st.column_config.NumberColumn(format="%.2f"),
+                                "Cost per lot": st.column_config.NumberColumn(format="%.0f"),
+                                "Move needed %": st.column_config.NumberColumn(
+                                    format="%.1f%%",
+                                    help="How far the stock must travel for this "
+                                         "to break even at expiry."),
+                                "Reachable": st.column_config.TextColumn(
+                                    help="Whether that move is within what this "
+                                         "stock typically covers by expiry."),
+                                "Chance ITM %": st.column_config.NumberColumn(format="%.0f%%"),
+                                "IV %": st.column_config.NumberColumn(format="%.1f"),
+                            },
+                            use_container_width=True, hide_index=True)
+                        st.caption(
+                            f"Lot size {lot}. Take a strike to the **Trade** tab "
+                            "for entry, target and stop in premium terms.")
 
             with st.expander("Full list"):
                 st.dataframe(
@@ -1051,6 +1198,7 @@ with tab_today, safe("Today"):
 
 with tab_falls, safe("Unfair falls"):
     st.markdown("### Which stocks fell more than the market explains?")
+    data_banner()
     st.markdown(
         "Your idea, made precise. A stock that falls because the whole market "
         "fell is a different thing from one that falls on its own news — the "
@@ -1176,6 +1324,7 @@ with tab_falls, safe("Unfair falls"):
 
 with tab_trade, safe("Trade"):
     st.markdown("### Which strike, and where do I get out?")
+    data_banner()
 
     if fno.empty:
         st.info("No data yet. Open the Data tab.")
@@ -1387,6 +1536,7 @@ with tab_trade, safe("Trade"):
 
 with tab_open, safe("Open positions"):
     st.markdown("### What am I holding?")
+    data_banner()
 
     j = load_journal()
     open_rows = j[j["status"].astype(str).str.lower() != "closed"] if not j.empty \
@@ -1485,6 +1635,7 @@ with tab_open, safe("Open positions"):
 
 with tab_journal, safe("Journal"):
     st.markdown("### Am I actually any good at this?")
+    data_banner()
     st.caption(
         "The only question that matters before sizing up. Log every trade with "
         "the reason, then let the numbers answer it."
@@ -1492,8 +1643,17 @@ with tab_journal, safe("Journal"):
 
     j = load_journal()
     if j.empty:
-        st.info("Nothing logged yet. Take a trade on the Trade tab, or paper "
-                "trade — the numbers work the same either way.")
+        st.markdown(
+            '<div class="card"><b>No trades logged yet — this is the empty '
+            'state, not an error.</b><br><span style="color:#8b95a1;'
+            'font-size:0.88rem;">Go to the <b>Trade</b> tab, pick a stock and '
+            'strike, write one line about why, and press <i>Add to journal</i>. '
+            'Paper trades count the same — you do not need to place money to '
+            'find out whether your reasoning holds up.<br><br>After about thirty '
+            'closed trades the win rate and average R at the top of this page '
+            'become the only numbers that matter.</span></div>',
+            unsafe_allow_html=True)
+        st.caption("Journal file location: data/journal.csv in your repo.")
     else:
         d = j.copy()
         for c in ("entry", "exit", "lots", "stop", "target"):
@@ -1564,6 +1724,7 @@ with tab_journal, safe("Journal"):
 
 with tab_patterns, safe("Patterns"):
     st.markdown("### Chart patterns, and whether they work")
+    data_banner()
     st.markdown(
         "Every pattern guide shows the examples that worked. This finds real "
         "instances in **your own stored data** and reports what happened after "
@@ -1572,7 +1733,14 @@ with tab_patterns, safe("Patterns"):
     )
 
     if hist.empty:
-        st.info("Needs price history. Open the Data tab.")
+        st.markdown(
+            '<div class="card"><b>No price history loaded — this is the empty '
+            'state, not an error.</b><br><span style="color:#8b95a1;'
+            'font-size:0.88rem;">These patterns are found in your own stored '
+            'data, so there has to be some. Run the <i>Collect</i> workflow with '
+            'a backfill of <b>400</b>, then reboot the app.<br><br>Each stock '
+            'needs 210 trading days before patterns can be computed at all.'
+            '</span></div>', unsafe_allow_html=True)
     else:
         days = hist["DATE"].nunique()
         if days < 260:
